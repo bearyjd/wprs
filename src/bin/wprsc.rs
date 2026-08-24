@@ -163,17 +163,19 @@ fn main() -> Result<()> {
 
     let mut event_loop = EventLoop::try_new()?;
 
-    event_loop.handle().insert_source(
-        reader,
-        |event, _metadata, state: &mut WprsClientState| {
-            match event {
+    let loop_signal = event_loop.get_signal();
+    event_loop
+        .handle()
+        .insert_source(
+            reader,
+            move |event, _metadata, state: &mut WprsClientState| match event {
                 Event::Msg(msg) => state.handle_request(msg),
                 Event::Closed => {
-                    unreachable!("serialization::client_loop terminates the process when the server disconnects.");
+                    loop_signal.stop();
                 },
-            }
-        },
-    ).unwrap();
+            },
+        )
+        .unwrap();
 
     {
         let capabilities = state.capabilities.clone();

@@ -78,6 +78,7 @@ tracy-allocator = ["tracy"]
 criterion = { version = "0.7.0", features = ["html_reports"] }
 png = "0.18.0"
 proptest = "1.7.0"
+tempfile = "3.21.0"
 trybuild = "1.0.110"
 
 # To run this benchmark, uncomment the block below and specify a directory of

@@ -26,7 +26,6 @@ use std::os::fd::AsFd;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process;
 use std::str;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -146,6 +145,10 @@ pub fn hash<T: Hash>(t: &T) -> u64 {
 }
 
 const CHANNEL_SIZE: usize = 1024;
+
+fn bounded_message_channel<T>() -> (Sender<T>, Receiver<T>) {
+    crossbeam_channel::bounded(CHANNEL_SIZE)
+}
 
 pub trait Serializable:
     Debug
@@ -537,7 +540,7 @@ where
             stream,
             read_channel_tx,
             write_channel_rx,
-            other_end_connected,
+            other_end_connected.clone(),
         )
         .location(loc!())?;
 
@@ -545,8 +548,8 @@ where
         // if was actually just a disconnection and not some other error.
         let result = utils::join_unwrap(read_thread);
         debug!("read thread joined: {:?}", result);
-        eprintln!("server disconnected: {result:?}");
-        process::exit(1);
+        other_end_connected.store(false, Ordering::Release);
+        result
     })
 }
 
@@ -611,12 +614,16 @@ where
         let (reader_tx, reader_rx): (channel::SyncSender<RecvType<RT>>, Channel<RecvType<RT>>) =
             channel::sync_channel(CHANNEL_SIZE);
         let (writer_tx, writer_rx): (Sender<SendType<ST>>, Receiver<SendType<ST>>) =
-            crossbeam_channel::unbounded();
+            bounded_message_channel();
         let other_end_connected = Arc::new(AtomicBool::new(true));
 
         {
             let other_end_connected = other_end_connected.clone();
-            thread::spawn(move || client_loop(stream, reader_tx, writer_rx, other_end_connected));
+            thread::spawn(move || {
+                if let Err(error) = client_loop(stream, reader_tx, writer_rx, other_end_connected) {
+                    debug!(?error, "client transport disconnected");
+                }
+            });
         }
 
         let writer_tx = DiscardingSender {
@@ -645,11 +652,60 @@ where
         InfallibleSender::new(self.write_handle.clone(), self)
     }
 
-    pub fn other_end_connected(&mut self) -> bool {
+    pub fn other_end_connected(&self) -> bool {
         self.other_end_connected.load(Ordering::Acquire)
     }
 
     pub fn set_other_end_connected(&mut self, state: bool) {
         self.other_end_connected.store(state, Ordering::Relaxed);
+    }
+}
+
+// These integration-style tests exercise Unix sockets and threads, which Miri's
+// default isolation deliberately does not provide.
+#[cfg(all(test, not(miri)))]
+mod transport_tests {
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn outbound_channel_has_a_fixed_capacity() {
+        let (sender, _receiver) = bounded_message_channel();
+        for value in 0..CHANNEL_SIZE {
+            sender.try_send(value).unwrap();
+        }
+        assert!(matches!(
+            sender.try_send(CHANNEL_SIZE),
+            Err(crossbeam_channel::TrySendError::Full(CHANNEL_SIZE))
+        ));
+    }
+
+    #[test]
+    fn client_disconnect_is_reported_without_terminating_process() {
+        let temp = TempDir::new().unwrap();
+        let socket = temp.path().join("wprs.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let peer = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+
+        let serializer = Serializer::<Event, Request>::new_client(&socket).unwrap();
+        peer.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while serializer.other_end_connected() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!serializer.other_end_connected());
+        thread::sleep(Duration::from_millis(600));
+        serializer
+            .writer()
+            .send(SendType::Object(Event::WprsClientConnect));
     }
 }

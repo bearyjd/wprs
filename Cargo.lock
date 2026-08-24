@@ -2463,6 +2463,7 @@ dependencies = [
  "smithay-client-toolkit",
  "static_assertions",
  "sysctl",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "tracing-tracy",

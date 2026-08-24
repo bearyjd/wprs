@@ -97,7 +97,7 @@ impl<S: Sender> Sender for DiscardingSender<S> {
     type T = S::T;
     type E = S::E;
     fn send(&self, msg: Self::T) -> Result<(), Self::E> {
-        self.sender.send(msg)
+        DiscardingSender::send(self, msg)
     }
 }
 
