@@ -245,6 +245,14 @@ impl XdgPopupState {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub struct WindowState(u16);
 
+impl WindowState {
+    /// Construct an empty state set for headless clients that originate a
+    /// toplevel configure without a toolkit-provided window state.
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+}
+
 impl From<WindowState> for ToplevelStateSet {
     fn from(window_state: WindowState) -> Self {
         let mut states = Self::default();
@@ -406,4 +414,14 @@ pub struct PopupRequest {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub enum PopupEvent {
     Configure(PopupConfigure),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WindowState;
+
+    #[test]
+    fn empty_window_state_has_no_flags() {
+        assert_eq!(WindowState::empty(), WindowState(0));
+    }
 }
