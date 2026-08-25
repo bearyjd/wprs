@@ -139,10 +139,17 @@ pub fn _mm256_castsi256_si128(a: __m256i) -> __m128i {
 pub unsafe fn _mm256_loadu_si256(src: *const __m256i) -> __m256i {
     // SAFETY: src is pointer to __m256i, so it is safe to read
     // 256 bits from it in two rounds of 128bit each.
+    //
+    // We must use raw pointers (`&raw const`) rather than references
+    // (`&(*src).low`) here: this is the *unaligned* load, so src may point at
+    // any address, but creating a reference to a place asserts that place is
+    // aligned. That assertion is undefined behavior on a misaligned src
+    // regardless of _mm_loadu_si128 being able to cope with it, and it aborts
+    // in builds with debug assertions enabled.
     unsafe {
         __m256i {
-            low: _mm_loadu_si128(&(*src).low),
-            high: _mm_loadu_si128(&(*src).high),
+            low: _mm_loadu_si128(&raw const (*src).low),
+            high: _mm_loadu_si128(&raw const (*src).high),
         }
     }
 }
@@ -150,11 +157,16 @@ pub unsafe fn _mm256_loadu_si256(src: *const __m256i) -> __m256i {
 #[target_feature(enable = "sse2")]
 #[inline]
 pub unsafe fn _mm256_storeu_si256(dst: *mut __m256i, a: __m256i) {
-    // SAFETY: dst is pointer to __m256i, so it is safe to read
-    // 256 bits from it in two rounds of 128bit each.
+    // SAFETY: dst is pointer to __m256i, so it is safe to write
+    // 256 bits to it in two rounds of 128bit each.
+    //
+    // As in _mm256_loadu_si256, we must use raw pointers (`&raw mut`) rather
+    // than references (`&mut (*dst).low`): dst is not required to be aligned,
+    // and creating a reference to a misaligned place is undefined behavior
+    // even though _mm_storeu_si128 itself performs an unaligned store.
     unsafe {
-        _mm_storeu_si128(&mut (*dst).low, a.low);
-        _mm_storeu_si128(&mut (*dst).high, a.high);
+        _mm_storeu_si128(&raw mut (*dst).low, a.low);
+        _mm_storeu_si128(&raw mut (*dst).high, a.high);
     }
 }
 
@@ -359,5 +371,49 @@ pub fn _mm256_shuffle_ps<const MASK: i32>(a: __m256, b: __m256) -> __m256 {
         low: _mm_shuffle_ps::<MASK>(a.low, b.low),
         // High lane shuffle: uses a.high and b.high
         high: _mm_shuffle_ps::<MASK>(a.high, b.high),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// _mm256_loadu_si256 and _mm256_storeu_si256 are the *unaligned*
+    /// load/store, so they must work at every byte offset. Callers in
+    /// filtering/x86.rs cast them from &[u8] pointers whose address depends on
+    /// the pixel count of the buffer being filtered, so any pixel count that
+    /// isn't a multiple of 16 lands them on an unaligned address.
+    ///
+    /// Before the &raw const / &raw mut fix these shims created references to
+    /// the .low/.high fields through the possibly-unaligned pointer, which
+    /// aborts with "misaligned pointer dereference" whenever debug assertions
+    /// are on and is undefined behavior regardless.
+    #[test]
+    fn loadu_storeu_si256_at_every_offset() {
+        // 32 bytes of payload plus a full 32-byte window of slack, so that
+        // every offset below has 32 readable/writable bytes after it.
+        let src: [u8; 64] = std::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(13));
+
+        for offset in 0..32 {
+            let mut dst = [0u8; 64];
+            // SAFETY: offset + 32 <= 64 for both buffers, so the 256-bit
+            // accesses stay in bounds. The pointers are deliberately not
+            // 16- or 32-byte aligned, which is exactly what these unaligned
+            // intrinsics must tolerate.
+            unsafe {
+                let block = _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>());
+                _mm256_storeu_si256(dst.as_mut_ptr().add(offset).cast::<__m256i>(), block);
+            }
+
+            assert_eq!(
+                &dst[offset..offset + 32],
+                &src[offset..offset + 32],
+                "roundtrip mismatch at offset {offset}"
+            );
+            assert!(
+                dst[..offset].iter().all(|b| *b == 0) && dst[offset + 32..].iter().all(|b| *b == 0),
+                "store at offset {offset} wrote outside its 32-byte window"
+            );
+        }
     }
 }

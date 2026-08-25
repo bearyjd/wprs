@@ -306,6 +306,14 @@ mod tests {
         assert_eq!(data, &output);
     }
 
+    /// Lengths are in bytes; the pixel count is a quarter of that.
+    ///
+    /// Sizes whose *pixel* count is at least 32 (one SIMD block) and not a
+    /// multiple of 16 are the interesting ones: the SoA channel slices then
+    /// start at addresses that are not 16-byte aligned, which is what caught
+    /// the misaligned-pointer bug in the SSE2/SSSE3/SSE4.1 _mm256_loadu_si256
+    /// shims (see src/simd/sse2_base.rs). 132 (33px), 400 (100px) and
+    /// 1023 * 767 * 4 (784641px, a realistic window size) all exercise that.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_roundtrip() {
@@ -337,10 +345,12 @@ mod tests {
             2048,
             2052,
             100,
+            400,
             1920 * 1080,
             32768 * 4 + 4,
             1008 * 9513 * 4,
             1008 * 951 * 4,
+            1023 * 767 * 4,
         ] {
             test_roundtrip_impl(&test_vec(n));
         }
