@@ -55,6 +55,53 @@ pub const MIN_SIZE_TO_COMPRESS: usize = 4096;
 pub const MAX_UNCOMPRESSED_OBJECT: usize = 80 * 1024 * 1024;
 pub const MAX_UNCOMPRESSED_RAW_BUFFER: usize = 128 * 1024 * 1024;
 
+/// The serialized indices blob is a `Vec<usize>` with one entry per shard;
+/// `ShardingDecompressor` is built with a small, fixed shard count (see
+/// `serialization/mod.rs`), so real values are a few hundred bytes. 1 MB is
+/// enormous headroom while still closing this allocation door.
+pub const MAX_INDICES_BLOB: usize = 1024 * 1024;
+
+/// `AlignedVec::framed_read` (`serialization/framing.rs`) allocates the
+/// wire-declared length before reading it -- the same hazard `uncompressed_size`
+/// has above. This reimplements that read with a bound checked before the
+/// allocation, instead of going through the unbounded generic impl.
+fn read_bounded_indices<R: Read>(stream: &mut R) -> Result<AlignedVec> {
+    let len = u32::framed_read(stream).location(loc!())?;
+    if len as usize > MAX_INDICES_BLOB {
+        bail!("indices blob declares {len} bytes, over the {MAX_INDICES_BLOB} ceiling");
+    }
+    let mut buf = AlignedVec::new();
+    buf.resize(len as usize, 0);
+    stream.read_exact(&mut buf).location(loc!())?;
+    Ok(buf)
+}
+
+/// `CompressedShard::framed_read` reads `data` via `Vec<u8>::framed_read`
+/// (`serialization/framing.rs`), which allocates the wire-declared length
+/// before reading it. A peer that clears the `uncompressed_size` ceiling by
+/// declaring a small value can still claim an arbitrary length for an
+/// individual shard's compressed payload, independent of that check -- so
+/// each shard's `data` needs its own bound, checked before allocation.
+/// `max_data_len` is the ceiling of the message kind this shard belongs to
+/// (`MAX_UNCOMPRESSED_OBJECT` or `MAX_UNCOMPRESSED_RAW_BUFFER`).
+fn read_bounded_shard<R: Read>(stream: &mut R, max_data_len: usize) -> Result<CompressedShard> {
+    let idx = usize::framed_read(stream).location(loc!())?;
+    let uncompressed_size = usize::framed_read(stream).location(loc!())?;
+    let compression = bool::framed_read(stream).location(loc!())?;
+    let data_len = u32::framed_read(stream).location(loc!())?;
+    if data_len as usize > max_data_len {
+        bail!("shard {idx} declares {data_len} bytes of data, over the {max_data_len} ceiling");
+    }
+    let mut data = vec![0; data_len as usize];
+    stream.read_exact(&mut data).location(loc!())?;
+    Ok(CompressedShard {
+        idx,
+        uncompressed_size,
+        compression,
+        data,
+    })
+}
+
 #[derive(Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub struct CompressedShard {
     pub idx: usize,
@@ -157,7 +204,7 @@ impl CompressedShards {
     where
         F: FnOnce(&[u8]) -> Result<T>,
     {
-        let serialized_indices = AlignedVec::framed_read(stream).location(loc!())?;
+        let serialized_indices = read_bounded_indices(stream).location(loc!())?;
         let indices =
             rkyv::from_bytes::<Vec<usize>, RancorError>(&serialized_indices).location(loc!())?;
         debug!("read indices: {:?}", indices);
@@ -171,7 +218,7 @@ impl CompressedShards {
         }
 
         let shards = (0..indices.len())
-            .map(|_| CompressedShard::framed_read(stream))
+            .map(|_| read_bounded_shard(stream, MAX_UNCOMPRESSED_OBJECT))
             .transpose_into_fallible();
         debug!("read data");
 
@@ -183,7 +230,7 @@ impl CompressedShards {
         stream: &mut R,
         decompressor: &mut ShardingDecompressor,
     ) -> Result<Vec<u8>> {
-        let serialized_indices = AlignedVec::framed_read(stream).location(loc!())?;
+        let serialized_indices = read_bounded_indices(stream).location(loc!())?;
         let indices =
             rkyv::from_bytes::<Vec<usize>, RancorError>(&serialized_indices).location(loc!())?;
         debug!("read indices: {:?}", indices);
@@ -197,7 +244,7 @@ impl CompressedShards {
         }
 
         let shards = (0..indices.len())
-            .map(|_| CompressedShard::framed_read(stream))
+            .map(|_| read_bounded_shard(stream, MAX_UNCOMPRESSED_RAW_BUFFER))
             .transpose_into_fallible();
         debug!("read data");
 
@@ -641,11 +688,77 @@ mod uncompressed_size_ceiling_tests {
         // An off-by-one here would reject legitimate maximum-size traffic
         // (e.g. a full 4K framebuffer), which would look like a blank or
         // broken screen rather than a failing test.
+        //
+        // `encode_stream` gives the single shard's own wire-declared `data`
+        // length the same value as `uncompressed_size`, so this doubles as
+        // the accept-at-exactly-the-ceiling proof for the per-shard `data`
+        // bound in `read_bounded_shard` (see `shard_data_*` below), not just
+        // for `uncompressed_size`.
         let mut stream = encode_stream(vec![0u8; MAX_UNCOMPRESSED_RAW_BUFFER]);
         let mut decompressor = ShardingDecompressor::new(NonZeroUsize::new(1).unwrap()).unwrap();
         let result =
             CompressedShards::streaming_framed_decompress_to_owned(&mut stream, &mut decompressor);
         assert!(result.is_ok(), "{:?}", result.err());
         assert_eq!(result.unwrap().len(), MAX_UNCOMPRESSED_RAW_BUFFER);
+    }
+
+    #[test]
+    fn indices_blob_refuses_over_the_ceiling() {
+        let mut buf = Vec::new();
+        ((MAX_INDICES_BLOB + 1) as u32)
+            .framed_write(&mut buf)
+            .unwrap();
+        let mut stream = Cursor::new(buf);
+        let result = read_bounded_indices(&mut stream);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn indices_blob_accepts_exactly_the_ceiling() {
+        // An off-by-one here would reject a legitimate maximum-shard-count
+        // session, which would look like a mysterious intermittent
+        // disconnect rather than a failing test.
+        let mut buf = Vec::new();
+        (MAX_INDICES_BLOB as u32).framed_write(&mut buf).unwrap();
+        buf.extend(vec![0u8; MAX_INDICES_BLOB]);
+        let mut stream = Cursor::new(buf);
+        let result = read_bounded_indices(&mut stream);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert_eq!(result.unwrap().len(), MAX_INDICES_BLOB);
+    }
+
+    #[test]
+    fn shard_data_refuses_over_the_ceiling() {
+        let mut buf = Vec::new();
+        0usize.framed_write(&mut buf).unwrap(); // idx
+        0usize.framed_write(&mut buf).unwrap(); // shard's own uncompressed_size field
+        false.framed_write(&mut buf).unwrap(); // compression
+        ((MAX_UNCOMPRESSED_OBJECT + 1) as u32)
+            .framed_write(&mut buf)
+            .unwrap(); // data length
+        let mut stream = Cursor::new(buf);
+        let result = read_bounded_shard(&mut stream, MAX_UNCOMPRESSED_OBJECT);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn shard_data_bound_is_independent_of_uncompressed_size() {
+        // A peer can declare a tiny message-level `uncompressed_size` to
+        // clear that ceiling, then claim an arbitrary length for an
+        // individual shard's own compressed `data`. The shard-level bound
+        // must catch that on its own, through the full public streaming
+        // API, without relying on the uncompressed_size check above it.
+        let mut buf = encode_header_declaring(1);
+        0usize.framed_write(&mut buf).unwrap(); // idx
+        0usize.framed_write(&mut buf).unwrap(); // shard's own uncompressed_size field
+        false.framed_write(&mut buf).unwrap(); // compression
+        ((MAX_UNCOMPRESSED_RAW_BUFFER + 1) as u32)
+            .framed_write(&mut buf)
+            .unwrap(); // data length
+        let mut stream = Cursor::new(buf);
+        let mut decompressor = ShardingDecompressor::new(NonZeroUsize::new(1).unwrap()).unwrap();
+        let result =
+            CompressedShards::streaming_framed_decompress_to_owned(&mut stream, &mut decompressor);
+        assert!(result.is_err());
     }
 }
