@@ -44,6 +44,17 @@ use crate::serialization::framing::Framed;
 // TODO: benchmark this and pick a value based on that.
 pub const MIN_SIZE_TO_COMPRESS: usize = 4096;
 
+/// `uncompressed_size` arrives off the wire as a u32 (see `Framed for usize` in
+/// `serialization/framing.rs`) and drives the buffer allocation in
+/// `decompress_impl`, so without a ceiling a peer can demand a 4 GB allocation
+/// before any content is validated.
+///
+/// Two values because the two message kinds are not alike: Object carries
+/// metadata and clipboard transfers, RawBuffer carries framebuffers (~33 MB for
+/// 4K at 32bpp).
+pub const MAX_UNCOMPRESSED_OBJECT: usize = 80 * 1024 * 1024;
+pub const MAX_UNCOMPRESSED_RAW_BUFFER: usize = 128 * 1024 * 1024;
+
 #[derive(Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub struct CompressedShard {
     pub idx: usize,
@@ -153,6 +164,11 @@ impl CompressedShards {
 
         let uncompressed_size = usize::framed_read(stream).location(loc!())?;
         debug!("read uncompressed_size: {:?}", uncompressed_size);
+        if uncompressed_size > MAX_UNCOMPRESSED_OBJECT {
+            bail!(
+                "object message declares {uncompressed_size} bytes, over the {MAX_UNCOMPRESSED_OBJECT} ceiling"
+            );
+        }
 
         let shards = (0..indices.len())
             .map(|_| CompressedShard::framed_read(stream))
@@ -174,6 +190,11 @@ impl CompressedShards {
 
         let uncompressed_size = usize::framed_read(stream).location(loc!())?;
         debug!("read uncompressed_size: {:?}", uncompressed_size);
+        if uncompressed_size > MAX_UNCOMPRESSED_RAW_BUFFER {
+            bail!(
+                "raw buffer message declares {uncompressed_size} bytes, over the {MAX_UNCOMPRESSED_RAW_BUFFER} ceiling"
+            );
+        }
 
         let shards = (0..indices.len())
             .map(|_| CompressedShard::framed_read(stream))
@@ -537,5 +558,94 @@ impl ShardingDecompressor {
         let mut vec: Vec<u8> = buf.try_into().unwrap();
         vec.truncate(uncompressed_size);
         Ok(vec)
+    }
+}
+
+#[cfg(test)]
+mod uncompressed_size_ceiling_tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    /// Builds a stream with only the header (sorted indices + the declared
+    /// `uncompressed_size`) and no shard payload. That's enough to exercise
+    /// the ceiling check, which runs immediately after `uncompressed_size` is
+    /// read and before any shard is read.
+    fn encode_header_declaring(uncompressed_size: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let indices: Vec<usize> = vec![0];
+        rkyv::to_bytes::<RancorError>(&indices)
+            .unwrap()
+            .framed_write(&mut buf)
+            .unwrap();
+        uncompressed_size.framed_write(&mut buf).unwrap();
+        buf
+    }
+
+    /// Builds a full stream: header declaring `data.len()` as the
+    /// uncompressed size, followed by a single, uncompressed shard (index 0)
+    /// carrying `data`. `compression: false` makes the decompressor thread do
+    /// a plain copy, so the test doesn't need a real zstd frame.
+    fn encode_stream(data: Vec<u8>) -> Cursor<Vec<u8>> {
+        let mut buf = encode_header_declaring(data.len());
+        let shard = CompressedShard {
+            idx: 0,
+            uncompressed_size: data.len(),
+            compression: false,
+            data,
+        };
+        shard.framed_write(&mut buf).unwrap();
+        Cursor::new(buf)
+    }
+
+    #[test]
+    fn object_refuses_over_the_ceiling() {
+        let mut stream = Cursor::new(encode_header_declaring(MAX_UNCOMPRESSED_OBJECT + 1));
+        let mut decompressor = ShardingDecompressor::new(NonZeroUsize::new(1).unwrap()).unwrap();
+        let result = CompressedShards::streaming_framed_decompress_with(
+            &mut stream,
+            &mut decompressor,
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn object_accepts_exactly_the_ceiling() {
+        // An off-by-one here would reject legitimate maximum-size traffic,
+        // which would look like a mysterious intermittent disconnect.
+        let mut stream = encode_stream(vec![0u8; MAX_UNCOMPRESSED_OBJECT]);
+        let mut decompressor = ShardingDecompressor::new(NonZeroUsize::new(1).unwrap()).unwrap();
+        let result = CompressedShards::streaming_framed_decompress_with(
+            &mut stream,
+            &mut decompressor,
+            |data| {
+                assert_eq!(data.len(), MAX_UNCOMPRESSED_OBJECT);
+                Ok(())
+            },
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn raw_buffer_refuses_over_the_ceiling() {
+        let mut stream = Cursor::new(encode_header_declaring(MAX_UNCOMPRESSED_RAW_BUFFER + 1));
+        let mut decompressor = ShardingDecompressor::new(NonZeroUsize::new(1).unwrap()).unwrap();
+        let result =
+            CompressedShards::streaming_framed_decompress_to_owned(&mut stream, &mut decompressor);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn raw_buffer_accepts_exactly_the_ceiling() {
+        // An off-by-one here would reject legitimate maximum-size traffic
+        // (e.g. a full 4K framebuffer), which would look like a blank or
+        // broken screen rather than a failing test.
+        let mut stream = encode_stream(vec![0u8; MAX_UNCOMPRESSED_RAW_BUFFER]);
+        let mut decompressor = ShardingDecompressor::new(NonZeroUsize::new(1).unwrap()).unwrap();
+        let result =
+            CompressedShards::streaming_framed_decompress_to_owned(&mut stream, &mut decompressor);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert_eq!(result.unwrap().len(), MAX_UNCOMPRESSED_RAW_BUFFER);
     }
 }
